@@ -1,0 +1,18 @@
+/target
+atlasdb_data/
+*.db
+*.wal
+
+# Node / UI
+ui/node_modules/
+ui/dist/
+ui/.env.local
+ui/.env.*.local
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

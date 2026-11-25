@@ -13,7 +13,6 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::query::executor::{Executor, QueryResult};
 use crate::catalog::schema::Catalog;
 use crate::parser::parser::parse_sql;
-use crate::storage::tuple::FieldValue;
 
 /// Shared application state.
 pub struct AppState {

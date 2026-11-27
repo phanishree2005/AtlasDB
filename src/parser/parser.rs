@@ -61,6 +61,21 @@ impl Parser {
                 }
             }
             Token::Drop => self.parse_drop_table(),
+            Token::Begin => {
+                self.advance();
+                if *self.peek() == Token::Transaction {
+                    self.advance();
+                }
+                Ok(Statement::BeginTransaction)
+            }
+            Token::Commit => {
+                self.advance();
+                Ok(Statement::Commit)
+            }
+            Token::Rollback => {
+                self.advance();
+                Ok(Statement::Rollback)
+            }
             _ => Err(format!("unexpected token: {:?}", self.peek())),
         };
         // Optional semicolon
@@ -101,6 +116,23 @@ impl Parser {
         } else {
             return Err("expected table name".into());
         };
+
+        // JOIN clauses: [INNER | LEFT | RIGHT] JOIN table ON expr
+        let mut joins = Vec::new();
+        while *self.peek() == Token::Join || *self.peek() == Token::Inner || *self.peek() == Token::Left || *self.peek() == Token::Right {
+            if *self.peek() == Token::Inner || *self.peek() == Token::Left || *self.peek() == Token::Right {
+                self.advance();
+            }
+            self.expect(&Token::Join)?;
+            let join_table = if let Token::Identifier(name) = self.advance() {
+                name
+            } else {
+                return Err("expected table name after JOIN".into());
+            };
+            self.expect(&Token::On)?;
+            let on_expr = self.parse_expr()?;
+            joins.push(JoinClause { table: join_table, on: on_expr });
+        }
 
         let where_clause = if *self.peek() == Token::Where {
             self.advance();
@@ -144,7 +176,7 @@ impl Parser {
             None
         };
 
-        Ok(Statement::Select { columns, from, where_clause, order_by, limit })
+        Ok(Statement::Select { columns, from, joins, where_clause, order_by, limit })
     }
 
     fn parse_insert(&mut self) -> Result<Statement, String> {
@@ -451,20 +483,40 @@ impl Parser {
             }
             Token::Identifier(name) => {
                 self.advance();
+                // Check for table.column dot notation
+                let full_name = if *self.peek() == Token::Dot {
+                    self.advance();
+                    if let Token::Identifier(col) = self.advance() {
+                        format!("{}.{}", name, col)
+                    } else if *self.peek() == Token::Star {
+                        self.advance();
+                        format!("{}.*", name)
+                    } else {
+                        return Err("expected column name after '.'".into());
+                    }
+                } else {
+                    name
+                };
+
                 // Check for function call
                 if *self.peek() == Token::LeftParen {
                     self.advance();
                     let mut args = Vec::new();
                     if *self.peek() != Token::RightParen {
                         loop {
-                            args.push(self.parse_expr()?);
+                            if *self.peek() == Token::Star {
+                                self.advance();
+                                args.push(Expr::ColumnRef("*".into()));
+                            } else {
+                                args.push(self.parse_expr()?);
+                            }
                             if !self.match_token(&Token::Comma) { break; }
                         }
                     }
                     self.expect(&Token::RightParen)?;
-                    Ok(Expr::Function { name, args })
+                    Ok(Expr::Function { name: full_name, args })
                 } else {
-                    Ok(Expr::ColumnRef(name))
+                    Ok(Expr::ColumnRef(full_name))
                 }
             }
             Token::LeftParen => {
@@ -568,5 +620,25 @@ mod tests {
             }
             _ => panic!("expected SELECT"),
         }
+    }
+
+    #[test]
+    fn test_parse_join() {
+        let stmt = parse_sql("SELECT users.name, orders.amount FROM users INNER JOIN orders ON users.id = orders.user_id").unwrap();
+        match stmt {
+            Statement::Select { from, joins, .. } => {
+                assert_eq!(from, "users");
+                assert_eq!(joins.len(), 1);
+                assert_eq!(joins[0].table, "orders");
+            }
+            _ => panic!("expected SELECT with JOIN"),
+        }
+    }
+
+    #[test]
+    fn test_parse_transaction() {
+        assert_eq!(parse_sql("BEGIN TRANSACTION").unwrap(), Statement::BeginTransaction);
+        assert_eq!(parse_sql("COMMIT").unwrap(), Statement::Commit);
+        assert_eq!(parse_sql("ROLLBACK").unwrap(), Statement::Rollback);
     }
 }

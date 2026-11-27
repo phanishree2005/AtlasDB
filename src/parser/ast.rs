@@ -22,10 +22,11 @@ pub enum Statement {
         columns: Option<Vec<String>>,
         values: Vec<Vec<Expr>>,
     },
-    /// SELECT columns FROM table [WHERE ...] [ORDER BY ...] [LIMIT ...]
+    /// SELECT columns FROM table [JOIN ...] [WHERE ...] [ORDER BY ...] [LIMIT ...]
     Select {
         columns: Vec<SelectColumn>,
         from: String,
+        joins: Vec<JoinClause>,
         where_clause: Option<Expr>,
         order_by: Option<Vec<OrderByItem>>,
         limit: Option<usize>,
@@ -48,6 +49,19 @@ pub enum Statement {
         column_name: String,
         unique: bool,
     },
+    /// BEGIN [TRANSACTION]
+    BeginTransaction,
+    /// COMMIT
+    Commit,
+    /// ROLLBACK
+    Rollback,
+}
+
+/// A JOIN clause: JOIN table ON expr
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClause {
+    pub table: String,
+    pub on: Expr,
 }
 
 /// Column specification in CREATE TABLE.

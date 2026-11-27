@@ -1,4 +1,5 @@
 /target
+/target_web
 atlasdb_data/
 *.db
 *.wal

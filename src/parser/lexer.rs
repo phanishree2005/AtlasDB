@@ -8,6 +8,8 @@ pub enum Token {
     Null, Is, As, Order, By, Asc, Desc, Limit, Primary, Key,
     Int, Integer, Bigint, Float, Double, Varchar, Text, Blob,
     Boolean, True, False, Unique,
+    Join, Inner, Left, Right,
+    Begin, Commit, Rollback, Transaction,
     Identifier(String),
     StringLiteral(String),
     IntegerLiteral(i64),
@@ -130,6 +132,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 "BLOB" => Token::Blob, "BOOLEAN" | "BOOL" => Token::Boolean,
                 "TRUE" => Token::True, "FALSE" => Token::False,
                 "UNIQUE" => Token::Unique,
+                "JOIN" => Token::Join, "INNER" => Token::Inner,
+                "LEFT" => Token::Left, "RIGHT" => Token::Right,
+                "BEGIN" => Token::Begin, "COMMIT" => Token::Commit,
+                "ROLLBACK" => Token::Rollback, "TRANSACTION" => Token::Transaction,
                 _ => Token::Identifier(word),
             };
             tokens.push(tok);

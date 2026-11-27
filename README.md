@@ -2,7 +2,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-63%20passed%20%7C%20100%25-brightgreen.svg)](#test-suite--verification)
+[![Tests](https://img.shields.io/badge/tests-68%20passed%20%7C%20100%25-brightgreen.svg)](#test-suite--verification)
 [![Tokio](https://img.shields.io/badge/async-Tokio%20%2F%20Axum-blueviolet.svg?logo=tokio)](https://tokio.rs/)
 [![React](https://img.shields.io/badge/frontend-React%2019%20%2F%20Vite-61dafb.svg?logo=react)](https://react.dev/)
 [![Safety](https://img.shields.io/badge/memory--safety-100%25%20Safe%20Rust-success.svg)](https://www.rust-lang.org/)
@@ -357,6 +357,12 @@ INSERT INTO accounts VALUES (102, 'alex', 7200.00, TRUE), (103, 'sam', 120.00, F
 SELECT * FROM accounts;
 SELECT username, balance FROM accounts WHERE balance >= 1000.0 AND is_active = TRUE;
 
+-- Multi-table relational JOINs (Nested Loop Join pipeline)
+SELECT users.name, orders.amount FROM users INNER JOIN orders ON users.id = orders.user_id;
+
+-- SQL Aggregate Functions
+SELECT COUNT(*), SUM(balance), AVG(balance), MIN(balance), MAX(balance) FROM accounts;
+
 -- Sorting and pagination
 SELECT * FROM accounts ORDER BY balance DESC LIMIT 10;
 
@@ -365,6 +371,11 @@ UPDATE accounts SET balance = 5000.0 WHERE username = 'phani';
 
 -- Record deletions
 DELETE FROM accounts WHERE is_active = FALSE;
+
+-- Transaction Control (ACID)
+BEGIN TRANSACTION;
+INSERT INTO accounts VALUES (104, 'jordan', 8900.0, TRUE);
+COMMIT; -- or ROLLBACK;
 ```
 
 ### Supported Data Types

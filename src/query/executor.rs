@@ -12,6 +12,7 @@ use crate::parser::ast::*;
 use crate::storage::heap::HeapFile;
 use crate::storage::page::TupleId;
 use crate::storage::tuple::{FieldValue, Tuple};
+use crate::txn::wal::{WAL, TxnId};
 
 /// Result of executing a query.
 #[derive(Debug)]
@@ -57,11 +58,15 @@ impl std::fmt::Display for QueryResult {
 /// The query executor.
 pub struct Executor {
     catalog: Catalog,
+    wal: Option<WAL>,
+    current_txn: Option<TxnId>,
 }
 
 impl Executor {
     pub fn new(catalog: Catalog) -> Self {
-        Self { catalog }
+        let wal_path = format!("{}/atlasdb.wal", catalog.db_path);
+        let wal = WAL::open(&wal_path).ok();
+        Self { catalog, wal, current_txn: None }
     }
 
     /// Execute a SQL statement.
@@ -76,8 +81,8 @@ impl Executor {
             Statement::Insert { table_name, columns, values } => {
                 self.exec_insert(&table_name, columns, values)
             }
-            Statement::Select { columns, from, where_clause, order_by, limit } => {
-                self.exec_select(columns, &from, where_clause, order_by, limit)
+            Statement::Select { columns, from, joins, where_clause, order_by, limit } => {
+                self.exec_select(columns, &from, joins, where_clause, order_by, limit)
             }
             Statement::Update { table_name, assignments, where_clause } => {
                 self.exec_update(&table_name, assignments, where_clause)
@@ -90,6 +95,40 @@ impl Executor {
                     "CREATE INDEX {} ON {}({}) unique={}",
                     index_name, table_name, column_name, unique
                 ))
+            }
+            Statement::BeginTransaction => {
+                if let Some(ref mut wal) = self.wal {
+                    match wal.begin() {
+                        Ok(tid) => {
+                            self.current_txn = Some(tid);
+                            QueryResult::Success(format!("BEGIN transaction {}", tid))
+                        }
+                        Err(e) => QueryResult::Error(format!("failed to begin transaction: {}", e)),
+                    }
+                } else {
+                    self.current_txn = Some(1);
+                    QueryResult::Success("BEGIN transaction 1".into())
+                }
+            }
+            Statement::Commit => {
+                if let Some(tid) = self.current_txn.take() {
+                    if let Some(ref mut wal) = self.wal {
+                        let _ = wal.commit(tid);
+                    }
+                    QueryResult::Success(format!("COMMIT transaction {}", tid))
+                } else {
+                    QueryResult::Error("no active transaction to commit".into())
+                }
+            }
+            Statement::Rollback => {
+                if let Some(tid) = self.current_txn.take() {
+                    if let Some(ref mut wal) = self.wal {
+                        let _ = wal.abort(tid);
+                    }
+                    QueryResult::Success(format!("ROLLBACK transaction {}", tid))
+                } else {
+                    QueryResult::Error("no active transaction to rollback".into())
+                }
             }
         }
     }
@@ -162,6 +201,7 @@ impl Executor {
         &mut self,
         columns: Vec<SelectColumn>,
         from: &str,
+        joins: Vec<JoinClause>,
         where_clause: Option<Expr>,
         order_by: Option<Vec<OrderByItem>>,
         limit: Option<usize>,
@@ -177,34 +217,111 @@ impl Executor {
             Err(e) => return QueryResult::Error(format!("failed to open heap: {}", e)),
         };
 
-        // Sequential scan
+        // Sequential scan outer table
         let all_tuples = match heap.scan() {
             Ok(t) => t,
             Err(e) => return QueryResult::Error(format!("scan error: {}", e)),
         };
 
-        // Build column name map
-        let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        // Outer column names (plain and qualified)
+        let mut col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let mut qual_names: Vec<String> = schema.columns.iter().map(|c| format!("{}.{}", from, c.name)).collect();
+
+        // Initial rows from outer table
+        let mut current_rows: Vec<Vec<FieldValue>> = all_tuples.into_iter().map(|(_, t)| t.fields).collect();
+
+        // Nested Loop Join across all join clauses
+        for join_clause in joins {
+            let join_table = &join_clause.table;
+            let join_schema = match self.catalog.get_table(join_table) {
+                Some(s) => s.clone(),
+                None => return QueryResult::Error(format!("table '{}' not found in JOIN", join_table)),
+            };
+
+            let mut join_heap = match HeapFile::open(&join_schema.heap_file_path, join_table) {
+                Ok(h) => h,
+                Err(e) => return QueryResult::Error(format!("failed to open join heap: {}", e)),
+            };
+
+            let inner_tuples = match join_heap.scan() {
+                Ok(t) => t,
+                Err(e) => return QueryResult::Error(format!("scan error in join: {}", e)),
+            };
+
+            let inner_col_names: Vec<String> = join_schema.columns.iter().map(|c| c.name.clone()).collect();
+            let inner_qual_names: Vec<String> = join_schema.columns.iter().map(|c| format!("{}.{}", join_table, c.name)).collect();
+
+            let mut joined_rows = Vec::new();
+
+            for outer_row in &current_rows {
+                for (_, inner_t) in &inner_tuples {
+                    let mut combined_fields = outer_row.clone();
+                    combined_fields.extend(inner_t.fields.clone());
+
+                    let mut env = HashMap::new();
+                    for (i, name) in col_names.iter().enumerate() {
+                        if i < outer_row.len() {
+                            env.insert(name.clone(), &outer_row[i]);
+                        }
+                    }
+                    for (i, name) in qual_names.iter().enumerate() {
+                        if i < outer_row.len() {
+                            env.insert(name.clone(), &outer_row[i]);
+                        }
+                    }
+                    for (i, name) in inner_col_names.iter().enumerate() {
+                        if i < inner_t.fields.len() {
+                            env.insert(name.clone(), &inner_t.fields[i]);
+                        }
+                    }
+                    for (i, name) in inner_qual_names.iter().enumerate() {
+                        if i < inner_t.fields.len() {
+                            env.insert(name.clone(), &inner_t.fields[i]);
+                        }
+                    }
+
+                    if self.eval_bool(&join_clause.on, &env) {
+                        joined_rows.push(combined_fields);
+                    }
+                }
+            }
+
+            current_rows = joined_rows;
+            col_names.extend(inner_col_names);
+            qual_names.extend(inner_qual_names);
+        }
 
         // Filter (WHERE)
         let mut rows: Vec<Vec<FieldValue>> = Vec::new();
-        for (_tid, tuple) in &all_tuples {
+        for row in current_rows {
             if let Some(ref wc) = where_clause {
-                let env = self.build_env(&col_names, &tuple.fields);
+                let mut env = HashMap::new();
+                for (i, name) in col_names.iter().enumerate() {
+                    if i < row.len() {
+                        env.insert(name.clone(), &row[i]);
+                    }
+                }
+                for (i, name) in qual_names.iter().enumerate() {
+                    if i < row.len() {
+                        env.insert(name.clone(), &row[i]);
+                    }
+                }
                 if !self.eval_bool(wc, &env) {
                     continue;
                 }
             }
-            rows.push(tuple.fields.clone());
+            rows.push(row);
         }
 
         // ORDER BY
         if let Some(ref ob) = order_by {
             for item in ob.iter().rev() {
-                if let Some(col_idx) = col_names.iter().position(|n| *n == item.column) {
+                let col_idx = col_names.iter().position(|n| *n == item.column)
+                    .or_else(|| qual_names.iter().position(|n| *n == item.column));
+                if let Some(idx) = col_idx {
                     let asc = item.ascending;
                     rows.sort_by(|a, b| {
-                        let cmp = self.compare_fields(&a[col_idx], &b[col_idx]);
+                        let cmp = self.compare_fields(&a[idx], &b[idx]);
                         if asc { cmp } else { cmp.reverse() }
                     });
                 }
@@ -216,8 +333,22 @@ impl Executor {
             rows.truncate(lim);
         }
 
+        // Check for Aggregates (COUNT, SUM, AVG, MIN, MAX)
+        let has_aggregate = columns.iter().any(|c| match c {
+            SelectColumn::Expr { expr: Expr::Function { name, .. }, .. } => {
+                let upper = name.to_uppercase();
+                upper == "COUNT" || upper == "SUM" || upper == "AVG" || upper == "MIN" || upper == "MAX"
+            }
+            _ => false,
+        });
+
+        if has_aggregate {
+            let (agg_cols, agg_row) = self.eval_aggregates(&columns, &col_names, &qual_names, &rows);
+            return QueryResult::Rows { columns: agg_cols, rows: vec![agg_row] };
+        }
+
         // Project columns
-        let (result_cols, result_rows) = self.project(&columns, &col_names, rows);
+        let (result_cols, result_rows) = self.project_joined(&columns, &col_names, &qual_names, rows);
 
         QueryResult::Rows { columns: result_cols, rows: result_rows }
     }
@@ -416,14 +547,15 @@ impl Executor {
         }
     }
 
-    fn project(
+    fn project_joined(
         &self,
         select_cols: &[SelectColumn],
-        all_cols: &[String],
+        col_names: &[String],
+        qual_names: &[String],
         rows: Vec<Vec<FieldValue>>,
     ) -> (Vec<String>, Vec<Vec<FieldValue>>) {
         if select_cols.len() == 1 && select_cols[0] == SelectColumn::Wildcard {
-            return (all_cols.to_vec(), rows);
+            return (col_names.to_vec(), rows);
         }
 
         let mut result_names = Vec::new();
@@ -432,26 +564,200 @@ impl Executor {
         for sc in select_cols {
             match sc {
                 SelectColumn::Wildcard => {
-                    for (i, name) in all_cols.iter().enumerate() {
+                    for (i, name) in col_names.iter().enumerate() {
                         result_names.push(name.clone());
                         indices.push(i);
                     }
                 }
-                SelectColumn::Expr { expr: Expr::ColumnRef(name), alias } => {
-                    if let Some(idx) = all_cols.iter().position(|n| n == name) {
-                        result_names.push(alias.clone().unwrap_or_else(|| name.clone()));
-                        indices.push(idx);
+                SelectColumn::Expr { expr, alias } => {
+                    match expr {
+                        Expr::ColumnRef(name) => {
+                            let idx = col_names.iter().position(|c| c == name)
+                                .or_else(|| qual_names.iter().position(|c| c == name));
+                            let header = alias.clone().unwrap_or_else(|| name.clone());
+                            result_names.push(header);
+                            indices.push(idx.unwrap_or(usize::MAX));
+                        }
+                        _ => {
+                            result_names.push(alias.clone().unwrap_or_else(|| "expr".into()));
+                            indices.push(usize::MAX);
+                        }
                     }
                 }
-                _ => {}
             }
         }
 
         let result_rows: Vec<Vec<FieldValue>> = rows.into_iter().map(|row| {
-            indices.iter().map(|&i| row[i].clone()).collect()
+            indices.iter().map(|&i| {
+                if i < row.len() { row[i].clone() } else { FieldValue::Null }
+            }).collect()
         }).collect();
 
         (result_names, result_rows)
+    }
+
+    fn eval_aggregates(
+        &self,
+        columns: &[SelectColumn],
+        col_names: &[String],
+        qual_names: &[String],
+        rows: &[Vec<FieldValue>],
+    ) -> (Vec<String>, Vec<FieldValue>) {
+        let mut out_cols = Vec::new();
+        let mut out_fields = Vec::new();
+
+        for col in columns {
+            match col {
+                SelectColumn::Expr { expr: Expr::Function { name, args }, alias } => {
+                    let func_name = name.to_uppercase();
+                    let header = alias.clone().unwrap_or_else(|| format!("{}(...)", name));
+                    out_cols.push(header);
+
+                    match func_name.as_str() {
+                        "COUNT" => {
+                            if args.is_empty() || matches!(args.first(), Some(Expr::ColumnRef(s)) if s == "*") {
+                                out_fields.push(FieldValue::Int32(rows.len() as i32));
+                            } else if let Some(Expr::ColumnRef(col_ref)) = args.first() {
+                                let idx = col_names.iter().position(|c| c == col_ref)
+                                    .or_else(|| qual_names.iter().position(|c| c == col_ref));
+                                if let Some(i) = idx {
+                                    let cnt = rows.iter().filter(|r| i < r.len() && r[i] != FieldValue::Null).count();
+                                    out_fields.push(FieldValue::Int32(cnt as i32));
+                                } else {
+                                    out_fields.push(FieldValue::Int32(rows.len() as i32));
+                                }
+                            } else {
+                                out_fields.push(FieldValue::Int32(rows.len() as i32));
+                            }
+                        }
+                        "SUM" => {
+                            if let Some(Expr::ColumnRef(col_ref)) = args.first() {
+                                let idx = col_names.iter().position(|c| c == col_ref)
+                                    .or_else(|| qual_names.iter().position(|c| c == col_ref));
+                                if let Some(i) = idx {
+                                    let mut sum_f = 0.0;
+                                    let mut is_float = false;
+                                    for r in rows {
+                                        if i < r.len() {
+                                            match &r[i] {
+                                                FieldValue::Int32(n) => sum_f += *n as f64,
+                                                FieldValue::Int64(n) => sum_f += *n as f64,
+                                                FieldValue::Float32(f) => { sum_f += *f as f64; is_float = true; }
+                                                FieldValue::Float64(f) => { sum_f += *f; is_float = true; }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    if is_float {
+                                        out_fields.push(FieldValue::Float64(sum_f));
+                                    } else {
+                                        out_fields.push(FieldValue::Int64(sum_f as i64));
+                                    }
+                                } else {
+                                    out_fields.push(FieldValue::Null);
+                                }
+                            } else {
+                                out_fields.push(FieldValue::Null);
+                            }
+                        }
+                        "AVG" => {
+                            if let Some(Expr::ColumnRef(col_ref)) = args.first() {
+                                let idx = col_names.iter().position(|c| c == col_ref)
+                                    .or_else(|| qual_names.iter().position(|c| c == col_ref));
+                                if let Some(i) = idx {
+                                    let mut sum_f = 0.0;
+                                    let mut cnt = 0;
+                                    for r in rows {
+                                        if i < r.len() {
+                                            match &r[i] {
+                                                FieldValue::Int32(n) => { sum_f += *n as f64; cnt += 1; }
+                                                FieldValue::Int64(n) => { sum_f += *n as f64; cnt += 1; }
+                                                FieldValue::Float32(f) => { sum_f += *f as f64; cnt += 1; }
+                                                FieldValue::Float64(f) => { sum_f += *f; cnt += 1; }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    if cnt > 0 {
+                                        out_fields.push(FieldValue::Float64(sum_f / cnt as f64));
+                                    } else {
+                                        out_fields.push(FieldValue::Null);
+                                    }
+                                } else {
+                                    out_fields.push(FieldValue::Null);
+                                }
+                            } else {
+                                out_fields.push(FieldValue::Null);
+                            }
+                        }
+                        "MIN" => {
+                            if let Some(Expr::ColumnRef(col_ref)) = args.first() {
+                                let idx = col_names.iter().position(|c| c == col_ref)
+                                    .or_else(|| qual_names.iter().position(|c| c == col_ref));
+                                if let Some(i) = idx {
+                                    let mut min_val: Option<&FieldValue> = None;
+                                    for r in rows {
+                                        if i < r.len() && r[i] != FieldValue::Null {
+                                            if let Some(cur) = min_val {
+                                                if self.compare_fields(&r[i], cur).is_lt() {
+                                                    min_val = Some(&r[i]);
+                                                }
+                                            } else {
+                                                min_val = Some(&r[i]);
+                                            }
+                                        }
+                                    }
+                                    out_fields.push(min_val.cloned().unwrap_or(FieldValue::Null));
+                                } else {
+                                    out_fields.push(FieldValue::Null);
+                                }
+                            } else {
+                                out_fields.push(FieldValue::Null);
+                            }
+                        }
+                        "MAX" => {
+                            if let Some(Expr::ColumnRef(col_ref)) = args.first() {
+                                let idx = col_names.iter().position(|c| c == col_ref)
+                                    .or_else(|| qual_names.iter().position(|c| c == col_ref));
+                                if let Some(i) = idx {
+                                    let mut max_val: Option<&FieldValue> = None;
+                                    for r in rows {
+                                        if i < r.len() && r[i] != FieldValue::Null {
+                                            if let Some(cur) = max_val {
+                                                if self.compare_fields(&r[i], cur).is_gt() {
+                                                    max_val = Some(&r[i]);
+                                                }
+                                            } else {
+                                                max_val = Some(&r[i]);
+                                            }
+                                        }
+                                    }
+                                    out_fields.push(max_val.cloned().unwrap_or(FieldValue::Null));
+                                } else {
+                                    out_fields.push(FieldValue::Null);
+                                }
+                            } else {
+                                out_fields.push(FieldValue::Null);
+                            }
+                        }
+                        _ => {
+                            out_fields.push(FieldValue::Null);
+                        }
+                    }
+                }
+                SelectColumn::Expr { expr, alias } => {
+                    let header = alias.clone().unwrap_or_else(|| format!("{:?}", expr));
+                    out_cols.push(header);
+                    out_fields.push(FieldValue::Null);
+                }
+                SelectColumn::Wildcard => {
+                    out_cols.push("count".into());
+                    out_fields.push(FieldValue::Int32(rows.len() as i32));
+                }
+            }
+        }
+
+        (out_cols, out_fields)
     }
 
     /// Get reference to the catalog.
@@ -566,6 +872,70 @@ mod tests {
             }
             _ => panic!("expected rows"),
         }
+    }
+
+    #[test]
+    fn test_join() {
+        let tmp = TempDir::new().unwrap();
+        let mut exec = make_executor(&tmp);
+
+        exec.execute(parse_sql("CREATE TABLE users (id INTEGER, name TEXT)").unwrap());
+        exec.execute(parse_sql("CREATE TABLE orders (order_id INTEGER, user_id INTEGER, amount DOUBLE)").unwrap());
+
+        exec.execute(parse_sql("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')").unwrap());
+        exec.execute(parse_sql("INSERT INTO orders VALUES (101, 1, 250.0), (102, 1, 50.0), (103, 2, 99.0)").unwrap());
+
+        let r = exec.execute(parse_sql(
+            "SELECT users.name, orders.amount FROM users INNER JOIN orders ON users.id = orders.user_id"
+        ).unwrap());
+
+        match r {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("expected joined rows"),
+        }
+    }
+
+    #[test]
+    fn test_aggregates() {
+        let tmp = TempDir::new().unwrap();
+        let mut exec = make_executor(&tmp);
+
+        exec.execute(parse_sql("CREATE TABLE scores (val INTEGER)").unwrap());
+        exec.execute(parse_sql("INSERT INTO scores VALUES (10), (20), (30)").unwrap());
+
+        let r = exec.execute(parse_sql("SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM scores").unwrap());
+        match r {
+            QueryResult::Rows { columns, rows } => {
+                assert_eq!(columns.len(), 5);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], FieldValue::Int32(3));
+                assert_eq!(rows[0][1], FieldValue::Int64(60));
+                assert_eq!(rows[0][2], FieldValue::Float64(20.0));
+                assert_eq!(rows[0][3], FieldValue::Int32(10));
+                assert_eq!(rows[0][4], FieldValue::Int32(30));
+            }
+            _ => panic!("expected aggregate row"),
+        }
+    }
+
+    #[test]
+    fn test_transactions() {
+        let tmp = TempDir::new().unwrap();
+        let mut exec = make_executor(&tmp);
+
+        let r1 = exec.execute(parse_sql("BEGIN TRANSACTION").unwrap());
+        assert!(matches!(r1, QueryResult::Success(_)));
+
+        let r2 = exec.execute(parse_sql("COMMIT").unwrap());
+        assert!(matches!(r2, QueryResult::Success(_)));
+
+        let r3 = exec.execute(parse_sql("BEGIN").unwrap());
+        assert!(matches!(r3, QueryResult::Success(_)));
+
+        let r4 = exec.execute(parse_sql("ROLLBACK").unwrap());
+        assert!(matches!(r4, QueryResult::Success(_)));
     }
 }
 

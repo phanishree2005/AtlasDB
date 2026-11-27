@@ -46,7 +46,14 @@ function App() {
     try {
       const response = await fetch(`${API_URL}/tables`);
       if (response.ok) {
-        const data = await response.json();
+        if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        setError(`Server returned HTTP ${response.status}: ${errorText || 'Query execution error'}`);
+        setResults(null);
+        return;
+      }
+      
+      const data = await response.json();
         setTables(data);
         setStatus('Connected');
       } else {
@@ -72,6 +79,13 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sql: query }),
       });
+      
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        setError(`Server returned HTTP ${response.status}: ${errorText || 'Query execution error'}`);
+        setResults(null);
+        return;
+      }
       
       const data = await response.json();
       const endTime = performance.now();

@@ -68,10 +68,30 @@ async fn handle_query(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<QueryRequest>,
 ) -> Json<QueryResponse> {
-    let mut exec = state.executor.lock().unwrap();
+    let mut exec = match state.executor.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     
     let result = match parse_sql(&payload.sql) {
-        Ok(stmt) => exec.execute(stmt),
+        Ok(stmt) => {
+            let exec_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                exec.execute(stmt)
+            }));
+            match exec_res {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = e.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Internal execution error".to_string()
+                    };
+                    QueryResult::Error(format!("Execution panic: {}", msg))
+                }
+            }
+        }
         Err(e) => QueryResult::Error(format!("Parse error: {}", e)),
     };
 
@@ -114,6 +134,9 @@ async fn handle_query(
 async fn handle_list_tables(
     State(state): State<Arc<AppState>>,
 ) -> Json<Vec<String>> {
-    let exec = state.executor.lock().unwrap();
+    let exec = match state.executor.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     Json(exec.catalog().list_tables().into_iter().map(|s| s.to_string()).collect())
 }

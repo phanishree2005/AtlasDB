@@ -321,7 +321,9 @@ impl Executor {
                 if let Some(idx) = col_idx {
                     let asc = item.ascending;
                     rows.sort_by(|a, b| {
-                        let cmp = self.compare_fields(&a[idx], &b[idx]);
+                        let a_field = a.get(idx).unwrap_or(&FieldValue::Null);
+                        let b_field = b.get(idx).unwrap_or(&FieldValue::Null);
+                        let cmp = self.compare_fields(a_field, b_field);
                         if asc { cmp } else { cmp.reverse() }
                     });
                 }

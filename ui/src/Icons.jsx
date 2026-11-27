@@ -110,3 +110,31 @@ export const AlertCircle = ({ size = 20, className = '', style = {} }) => (
     <line x1="12" y1="16" x2="12.01" y2="16" />
   </svg>
 );
+
+export const Copy = ({ size = 20, className = '', style = {} }) => (
+  <svg {...defaultProps(size, className, style)}>
+    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  </svg>
+);
+
+export const Download = ({ size = 20, className = '', style = {} }) => (
+  <svg {...defaultProps(size, className, style)}>
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <polyline points="7 10 12 15 17 10" />
+    <line x1="12" y1="15" x2="12" y2="3" />
+  </svg>
+);
+
+export const Trash = ({ size = 20, className = '', style = {} }) => (
+  <svg {...defaultProps(size, className, style)}>
+    <polyline points="3 6 5 6 21 6" />
+    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+  </svg>
+);
+
+export const Sparkles = ({ size = 20, className = '', style = {} }) => (
+  <svg {...defaultProps(size, className, style)}>
+    <path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z" />
+  </svg>
+);

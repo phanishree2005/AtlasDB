@@ -13,7 +13,7 @@ import {
   Clock,
   CheckCircle,
   AlertCircle
-} from 'lucide-react';
+} from './Icons.jsx';
 
 const API_URL = 'http://localhost:3000';
 
